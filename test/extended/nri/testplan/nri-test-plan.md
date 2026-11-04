@@ -2,7 +2,7 @@
 **Feature:** [OCPNODE-4853](https://redhat.atlassian.net/browse/OCPNODE-4853) — NRI test suite: add `openshift/nri` extended tests and test plan
 **Testing Epic:** [OCPNODE-4852](https://redhat.atlassian.net/browse/OCPNODE-4852) — Test coverage for NRI Plugin Support in CRI-O (GA 5.1)
 **Component:** Node / CRI-O (neither OCPNODE ticket sets a component; scope taken from the epic)
-**Snapshot pin:** PR [#31844](https://github.com/openshift/origin/pull/31844), based on `openshift/origin` `upstream/main` `895e3d93a0`; behavior sampled on OCP 4.22.21 with CRI-O 1.35.10 on RHCOS 9.8
+**Snapshot pin:** PR [#31844](https://github.com/openshift/origin/pull/31844), based on `openshift/origin` `upstream/main` `895e3d93a0`; behavior sampled on OCP 4.22.21 and 4.22.22 with CRI-O 1.35.10 on RHCOS 9.8. Revision 2.2 adds and validates the community `nri-iops` scenario on branch `nri-iops-test`.
 
 # Test Plan: NRI plugin integration on OpenShift (`openshift/nri`)
 
@@ -15,8 +15,8 @@
 | Field | Value |
 |---|---|
 | **Identifier** | OCPNODE-4853-test-plan |
-| **Revision** | 2.0 |
-| **Date** | 2026-11-03 |
+| **Revision** | 2.2 |
+| **Date** | 2026-11-05 |
 | **Author** | Node Team |
 | **PR classification** | Test-only. PR #31844 changes only test code, test fixtures, a test-only image and docs, so this is a test-code-as-deliverable plan: it describes what the new tests cover, not tests of a product change. |
 
@@ -53,6 +53,7 @@ Out of scope: the plugin implementations themselves (gpu-fractioning and other o
 - CRI-O's own [test/nri.bats](https://github.com/cri-o/cri-o/blob/main/test/nri.bats) starts a throwaway CRI-O and drives it with `crictl`. It cannot prove that an OCP node with MCO-managed CRI-O config, SELinux enforcing, PodSecurity admission and a payload image behaves the same. The downstream suite drives everything through the Kubernetes API: the plugin is a DaemonSet and the workloads are pods.
 - The test plugin in `test/extended/nri/plugin` records NRI events as JSON lines on stdout; the suite reads them from the pod logs and adjusts only pods that carry `nri.openshift.io/test: "true"`.
 - The plugin ships as its own payload image, `images/nri-test-plugin/Dockerfile.rhel`, so the release tests image is untouched.
+- The community [nri-iops](https://github.com/bitoku/blockio-nri) plugin limits block I/O by setting cgroup v2 `io.max` from goresctrl classes selected by the `io-limits.noderesource.dev` pod annotation. It is deployed as a DaemonSet; the `nri-plugins-operator` does not manage it (it only manages the `containers/nri-plugins` plugins).
 
 ### 2.4 References
 
@@ -70,6 +71,7 @@ Out of scope: the plugin implementations themselves (gpu-fractioning and other o
 | R10 | CRI-O [crio.conf.5 `[crio.nri]`](https://github.com/cri-o/cri-o/blob/main/docs/crio.conf.5.md#crionri-table) — `enable_nri` default |
 | R11 | [containerd/nri](https://github.com/containerd/nri) — NRI API and plugin ordering |
 | R12 | [gpu-fractioning prerequisites](https://github.com/kai-scheduler/gpu-fractioning#prerequisites) |
+| R13 | [bitoku/blockio-nri](https://github.com/bitoku/blockio-nri) — community nri-iops plugin (`io.max` IOPS limits) |
 
 ---
 
@@ -103,6 +105,7 @@ Out of scope: the plugin implementations themselves (gpu-fractioning and other o
 - Two plugins registered at different indices, invocation order and merged adjustments
 - Pod churn with a plugin registered
 - Pod creation while the plugin is down, and resynchronization after it returns
+- IOPS limiting for pods through the community `nri-iops` plugin (cgroup v2 `io.max`)
 - Suite skip behavior when NRI is disabled
 - Single node clusters (control-plane fallback)
 
@@ -178,7 +181,7 @@ None. NRI has no OpenShift feature gate; it is enabled by default since CRI-O 1.
 
 ## 7. Item Pass/Fail Criteria
 
-1. All eleven suite specs pass in one ordered run (`openshift-tests run openshift/nri`) on a supported payload.
+1. All suite specs pass in one ordered run (`openshift-tests run openshift/nri`) on a supported payload; the IOPS scenario skips when no `nri-iops` image is configured.
 2. Three consecutive runs are green with no retries; a flake in any scenario is a failure for the purpose of this plan.
 3. The plugin parser unit tests pass in the payload image build (TC-UNIT-001).
 4. TC-FUNC-003 proves the gpu-fractioning prerequisites: environment and bind mount injected by a DaemonSet plugin at container-create time, with the read-only mount enforcing `EROFS`.
@@ -186,12 +189,13 @@ None. NRI has no OpenShift feature gate; it is enabled by default since CRI-O 1.
 6. TC-FUNC-006 proves pod creation works while no plugin is registered.
 7. The suite leaves no state: plugin DaemonSet and namespace deleted, no host paths written.
 8. The suite skips (not fails) when NRI is disabled, the node has a single online CPU, or the cluster is MicroShift. A skip on a payload that should have NRI is a failure of this plan.
+9. TC-FUNC-007 passes when `NRI_IOPS_PLUGIN_IMAGE` points at the community `nri-iops` image; it skips when the image is not configured.
 9. No monitor failure is attributable to the suite. For example, the suite must not create force-deleted pods in a platform namespace.
 
 ### 7.1 Pre-existing verification evidence
 
 - PR #31844 [run history]: the pre-redesign suite passed 11/11 in one ordered run on OCP 4.22.21 / CRI-O 1.35.10 (single worker node).
-- The event-log redesign (plugin events read from the pod logs, no `oc debug`, no host paths) was built and unit-tested but not yet run end to end; the first run of that redesign failed in `BeforeAll` because the CLI log reader returned `ContainerCreating` for the polling window, and the reader was moved to the `pods/log` API afterwards. Re-run required before sign-off.
+- The event-log redesign (plugin events read from the pod logs, no `oc debug`, no host paths) was validated on OCP 4.22.22: 12/12 suite specs pass, including TC-FUNC-007.
 - Parser unit tests pass locally; real plugin log lines from the failed run parsed to 111 events, including `configure`.
 
 ---
@@ -215,6 +219,7 @@ None. NRI has no OpenShift feature gate; it is enabled by default since CRI-O 1.
 
 - `test/extended/nri/nri.go`, `nri_helpers.go` — the suite
 - `test/extended/nri/plugin/` — the plugin, parser unit tests and local build
+- `test/extended/nri` — the `nri-iops` IOPS-limit scenario (TC-FUNC-007)
 - `images/nri-test-plugin/Dockerfile.rhel` — the payload image
 - `pkg/testsuites/standard_suites.go`, `test/extended/include.go` — suite registration
 - CI job for `openshift/nri` and its artifacts
@@ -231,7 +236,8 @@ None. NRI has no OpenShift feature gate; it is enabled by default since CRI-O 1.
 4. Add Polarion/`[OTP]` IDs to the eleven specs for QE reporting.
 5. Add the test cases to `openshift-eng/ci-test-mapping` so Component Readiness can track them (new suite, new tests).
 6. Run SNO and multi-node clusters (TC-DEPLOY-003) and HyperShift (TC-DEPLOY-004).
-7. Track the deferred scenarios in the appendix.
+7. Publish the community `nri-iops` image (or point at a published one) and set `NRI_IOPS_PLUGIN_IMAGE` in the job so TC-FUNC-007 runs.
+8. Track the deferred scenarios in the appendix.
 
 ---
 
@@ -241,7 +247,7 @@ None. NRI has no OpenShift feature gate; it is enabled by default since CRI-O 1.
 
 | Item | Requirement |
 |---|---|
-| OCP version | 4.17 or later (CRI-O 1.30+ defaults NRI on); validated on 4.22.21 with CRI-O 1.35.10 |
+| OCP version | 4.17 or later (CRI-O 1.30+ defaults NRI on); validated on 4.22.21 and 4.22.22 with CRI-O 1.35.10 |
 | Node OS | RHCOS, SELinux enforcing, cgroup v2 |
 | Runtime | CRI-O with NRI enabled |
 | Topology | Multi-node validated on a single worker; SNO and multi-node runs still required |
@@ -249,7 +255,7 @@ None. NRI has no OpenShift feature gate; it is enabled by default since CRI-O 1.
 | FIPS | Proposed (TC-NFR-003) |
 | Platform | AWS validated; bare metal proposed |
 | Admission | Namespace with PSA `enforce=privileged` and the `privileged` SCC bound to `default` |
-| Images | In-cluster `tools` imagestream for test pods; `nri-test-plugin` payload image |
+| Images | In-cluster `tools` imagestream for test pods; `nri-test-plugin` payload image; community `nri-iops` image via `NRI_IOPS_PLUGIN_IMAGE` (optional scenario) |
 | Access | Cluster admin (SCC binding, namespace creation); no node debug access needed |
 
 ### 11.2 SNO vs multi-node
@@ -275,7 +281,7 @@ The suite picks a Ready worker, falls back to a non-control-plane node, then to 
 | Cadence | Nightly; pre-merge when CRI-O, MCO or the suite changes |
 | SNO / multi-node | Same suite; only the cluster topology differs |
 | Upgrade | TC-UPGRD-001 on a z-stream job |
-| Manual | `NRI_TEST_PLUGIN_IMAGE=<image> openshift-tests run openshift/nri`, image built with `make -C test/extended/nri/plugin image` |
+| Manual | `NRI_TEST_PLUGIN_IMAGE=<image> NRI_IOPS_PLUGIN_IMAGE=<nri-iops image> openshift-tests run openshift/nri`, images built as described above |
 
 ---
 
@@ -307,7 +313,6 @@ TBD; GA target 5.1 per OCPSTRAT-3973. No test-specific milestones are defined ye
 
 | Risk | Impact | Contingency |
 |---|---|---|
-| Event-log redesign not yet run end to end | Merge blocker | Re-run the suite on a cluster before merge |
 | The `nri-test-plugin` image is not in the payload | Suite cannot run in CI | `NRI_TEST_PLUGIN_IMAGE` override; land the `openshift/release` entry |
 | The plugin pod is privileged and mints host mounts/devices on request | Node exposure if the plugin outlives the test | Only adjusts pods in its own namespace; namespace deletion removes the DaemonSet; annotation input documented as trusted |
 | NRI-injected mounts keep the source SELinux label | Plugin-owned paths need relabeling, which the suite does not cover | Suite mounts container-readable host files; relabeling requirement documented |
@@ -315,6 +320,8 @@ TBD; GA target 5.1 per OCPSTRAT-3973. No test-specific milestones are defined ye
 | Upstream CRI-O changes the `enable_nri` default or socket path | Suite skips or fails for the wrong reason | TC-FUNC-001 fails loudly; update the check when the runtime changes |
 | No Polarion/OTP IDs or conformance gate | Regressions go unnoticed and QE cannot report | Testing tasks 3 and 4 |
 | Plugin parser accepts negative major/minor | Invalid input reaches runc | TC-UNIT-002 (deferred) |
+| The community `nri-iops` image is not published or not pullable | TC-FUNC-007 skips or fails in CI | Publish the image and set `NRI_IOPS_PLUGIN_IMAGE`; the suite skips without it |
+| `nri-iops` only matches block devices present on the node | Class globs match no device and `io.max` stays empty | Globs cover the common cloud/VM devices; TC-FUNC-007 shows the empty `io.max` in the failure message |
 
 ---
 
@@ -331,7 +338,7 @@ TBD; GA target 5.1 per OCPSTRAT-3973. No test-specific milestones are defined ye
 
 Detailed steps and expected output are in the companion [nri-test-cases.md](nri-test-cases.md). All implemented scenarios target `openshift/origin/test/extended/nri` and apply to OCP 4.17+.
 
-### 17.1 Implemented in PR #31844
+### 17.1 Implemented in PR #31844 and the `nri-iops` follow-up
 
 | ID | Title | Tier | Target file | Coverage | Implementation | Traceability |
 |---|---|---|---|---|---|---|
@@ -347,6 +354,7 @@ Detailed steps and expected output are in the companion [nri-test-cases.md](nri-
 | TC-SEC-001 | Pods outside the plugin's namespace are not adjusted | `e2e-serial` | `test/extended/nri/nri.go` | Covered | Implemented in #31844 | Privilege confinement |
 | TC-SEC-002 | A privileged plugin pod is rejected without SCC/PSA privileges | `e2e-serial` | `test/extended/nri/nri.go` | Covered | Implemented in #31844 | Privilege confinement |
 | TC-NFR-001 | 10-pod churn with a plugin registered | `e2e-serial` | `test/extended/nri/nri.go` | Covered | Implemented in #31844 | Scale sanity |
+| TC-FUNC-007 | Pod IOPS limit through the community `nri-iops` plugin | `e2e-serial` | `test/extended/nri/nri.go` | Covered (skips without the image) | Implemented and validated on 4.22.22 | NRI plugin IOPS limiting |
 
 ### 17.2 Proposed and deferred
 
@@ -388,6 +396,7 @@ What the test code now covers:
 - The adjustment primitives production plugins use: environment, annotations, bind mounts (with `ro` enforcement), devices, cpuset
 - Failure policy, opt-in gating, namespace and admission confinement, two-plugin ordering, churn, and plugin downtime
 - Parser edge cases for env/annotations, mounts and device modes in unit tests
+- IOPS limiting for a pod through a real community plugin (`nri-iops`), verified through cgroup v2 `io.max` (opt-in via `NRI_IOPS_PLUGIN_IMAGE`)
 
 Gaps in the test code:
 
@@ -395,6 +404,7 @@ Gaps in the test code:
 - HyperShift has not been run (TC-DEPLOY-004)
 - No real plugin (for example gpu-fractioning) is used in CI; the suite's plugin is a stand-in (TC-NFR-004 is manual)
 - Plugin-owned path relabeling is not covered; the suite mounts host files containers already read (`/proc/version`, `/dev/null`)
+- The `nri-iops` scenario is opt-in via `NRI_IOPS_PLUGIN_IMAGE`; it was validated on OCP 4.22.22 with a locally built image, but the community image still needs to be published for CI
 - The plugin parser still accepts negative device major/minor (TC-UNIT-002)
 - The event-log redesign is not yet re-run on a cluster; the last full green run predates it
 - No Polarion/OTP IDs, so QE reporting cannot track the specs
@@ -472,6 +482,8 @@ The repository has an existing plan convention (`test/extended/node/testplan/ker
 |---|---|---|---|
 | 1.0–1.7 | 2026-11-02/03 | Node Team | Iterations while building the suite: initial plan, suite-coverage gaps, implemented scenarios, cluster runs, SELinux mount workaround, node fallback and ordering, log-based event source |
 | 2.0 | 2026-11-03 | Node Team | Regenerated with `openshift-developer:generate-test-plan`: plan status header, `TC-*` scenario IDs with tiers and traceability, CI placement matrix, criteria assessment, coverage/gap report, test adequacy assessment, deferred-scenario backlog, conformance report and metadata |
+| 2.1 | 2026-11-03 | Node Team | Added TC-FUNC-007: IOPS limiting through the community `nri-iops` plugin (`io.max`), opt-in via `NRI_IOPS_PLUGIN_IMAGE` |
+| 2.2 | 2026-11-05 | Node Team | Validated TC-FUNC-007 on OCP 4.22.22: class devices restricted to whole block devices (partitions make the `io.max` write fail with `ENODEV`), wait for the plugin's `configuring plugin` log, and wait for `Synchronize` in TC-FUNC-001 |
 
 ---
 
@@ -485,14 +497,14 @@ prs_analyzed:
   - url: https://github.com/openshift/origin/pull/31844
     state: open
     base_branch: main
-scenario_count: 23
+scenario_count: 24
 scenarios_by_tier:
   unit: 2
   integration: 0
-  e2e-serial: 11
+  e2e-serial: 12
   e2e-periodic: 10
 coverage:
-  covered: 12
+  covered: 13
   partial: 2
   gap: 9
   preliminary: 0

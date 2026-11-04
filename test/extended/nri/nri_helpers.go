@@ -40,6 +40,13 @@ const (
 	pluginImageTag   = "nri-test-plugin"
 	imageEnv         = "NRI_TEST_PLUGIN_IMAGE"
 
+	// iopsPluginName is the community nri-iops plugin, which sets io.max from
+	// goresctrl block I/O classes selected by pod annotation.
+	iopsPluginName = "nri-iops"
+	iopsConfigName = iopsPluginName + "-config"
+	iopsAnnotation = "io-limits.noderesource.dev"
+	iopsImageEnv   = "NRI_IOPS_PLUGIN_IMAGE"
+
 	pluginDisabledNode = "nri-plugin-disabled.invalid"
 )
 
@@ -221,8 +228,7 @@ type pluginOptions struct {
 	ignoreAnnotations bool
 }
 
-// deployPlugin rolls out an NRI test plugin DaemonSet on the node.
-func deployPlugin(ctx context.Context, oc *exutil.CLI, node *corev1.Node, image string, opts pluginOptions) {
+func tolerationsFor(node *corev1.Node) []corev1.Toleration {
 	tolerations := []corev1.Toleration{}
 	for _, taint := range node.Spec.Taints {
 		tolerations = append(tolerations, corev1.Toleration{
@@ -232,6 +238,11 @@ func deployPlugin(ctx context.Context, oc *exutil.CLI, node *corev1.Node, image 
 			Effect:   taint.Effect,
 		})
 	}
+	return tolerations
+}
+
+// deployPlugin rolls out an NRI test plugin DaemonSet on the node.
+func deployPlugin(ctx context.Context, oc *exutil.CLI, node *corev1.Node, image string, opts pluginOptions) {
 	args := []string{
 		"--namespace=" + oc.Namespace(),
 		"--name=" + opts.name,
@@ -254,7 +265,7 @@ func deployPlugin(ctx context.Context, oc *exutil.CLI, node *corev1.Node, image 
 				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": opts.name}},
 				Spec: corev1.PodSpec{
 					NodeSelector: map[string]string{"kubernetes.io/hostname": node.Name},
-					Tolerations:  tolerations,
+					Tolerations:  tolerationsFor(node),
 					Containers:   []corev1.Container{privilegedPluginContainer(image, args)},
 					Volumes:      []corev1.Volume{nriSocketVolume()},
 				},
@@ -263,6 +274,129 @@ func deployPlugin(ctx context.Context, oc *exutil.CLI, node *corev1.Node, image 
 	}
 	_, err := oc.AdminKubeClient().AppsV1().DaemonSets(oc.Namespace()).Create(ctx, ds, metav1.CreateOptions{})
 	o.Expect(err).NotTo(o.HaveOccurred(), "failed to create the %s DaemonSet", opts.name)
+}
+
+// deployIOPSPlugin deploys the community nri-iops plugin with a low-iops class
+// (100 read/write IOPS) matching the usual cloud and virtual disk devices.
+func deployIOPSPlugin(ctx context.Context, oc *exutil.CLI, node *corev1.Node, image string) {
+	config := `failOnInvalidAnnotation: false
+logLevel: info
+Classes:
+  low-iops:
+    - Devices:
+        - /dev/nvme[0-9]n[0-9]
+        - /dev/nvme[0-9][0-9]n[0-9]
+        - /dev/xvd[a-z]
+        - /dev/sd[a-z]
+        - /dev/vd[a-z]
+        - /dev/dm-[0-9]*
+        - /dev/mapper/*
+      ThrottleReadIOPS: "100"
+      ThrottleWriteIOPS: "100"
+`
+	_, err := oc.AdminKubeClient().CoreV1().ConfigMaps(oc.Namespace()).Create(ctx, &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: iopsConfigName, Namespace: oc.Namespace()},
+		Data:       map[string]string{"nri-iops.conf": config},
+	}, metav1.CreateOptions{})
+	o.Expect(err).NotTo(o.HaveOccurred(), "failed to create the nri-iops ConfigMap")
+
+	ds := &appsv1.DaemonSet{
+		ObjectMeta: metav1.ObjectMeta{Name: iopsPluginName, Namespace: oc.Namespace()},
+		Spec: appsv1.DaemonSetSpec{
+			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": iopsPluginName}},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": iopsPluginName}},
+				Spec: corev1.PodSpec{
+					NodeSelector: map[string]string{"kubernetes.io/hostname": node.Name},
+					Tolerations:  tolerationsFor(node),
+					Containers: []corev1.Container{{
+						Name:    "nri-iops",
+						Image:   image,
+						Command: []string{"/opt/nri/plugins/90-nri-iops"},
+						Args: []string{
+							"-config=/etc/nri-iops/nri-iops.conf",
+							"-plugin-name=" + iopsPluginName,
+							"-plugin-idx=90",
+						},
+						// The plugin connects to the root-only NRI socket and
+						// stats host block devices.
+						SecurityContext: &corev1.SecurityContext{
+							Privileged: ptr.To(true),
+							RunAsUser:  ptr.To[int64](0),
+						},
+						VolumeMounts: []corev1.VolumeMount{
+							{Name: "config", MountPath: "/etc/nri-iops"},
+							{Name: "nri-socket", MountPath: "/var/run/nri", ReadOnly: true},
+							{Name: "dev", MountPath: "/dev", ReadOnly: true},
+						},
+					}},
+					Volumes: []corev1.Volume{
+						{
+							Name: "config",
+							VolumeSource: corev1.VolumeSource{
+								ConfigMap: &corev1.ConfigMapVolumeSource{
+									LocalObjectReference: corev1.LocalObjectReference{Name: iopsConfigName},
+								},
+							},
+						},
+						nriSocketVolume(),
+						{
+							Name: "dev",
+							VolumeSource: corev1.VolumeSource{
+								HostPath: &corev1.HostPathVolumeSource{Path: "/dev"},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+	_, err = oc.AdminKubeClient().AppsV1().DaemonSets(oc.Namespace()).Create(ctx, ds, metav1.CreateOptions{})
+	o.Expect(err).NotTo(o.HaveOccurred(), "failed to create the nri-iops DaemonSet")
+
+	waitPodRunningByLabel(ctx, oc, iopsPluginName)
+	waitForLog(ctx, oc, iopsPluginName, "configuring plugin")
+}
+
+func deleteIOPSPlugin(ctx context.Context, oc *exutil.CLI) {
+	deletePlugin(ctx, oc, iopsPluginName)
+	err := oc.AdminKubeClient().CoreV1().ConfigMaps(oc.Namespace()).Delete(ctx, iopsConfigName, metav1.DeleteOptions{})
+	if err != nil && !apierrors.IsNotFound(err) {
+		e2e.Logf("failed to delete ConfigMap %s: %v", iopsConfigName, err)
+	}
+	waitNoPluginPods(ctx, oc, iopsPluginName)
+}
+
+func waitPodRunningByLabel(ctx context.Context, oc *exutil.CLI, label string) {
+	err := wait.PollUntilContextTimeout(ctx, 2*time.Second, 3*time.Minute, true, func(ctx context.Context) (bool, error) {
+		pods, err := oc.AdminKubeClient().CoreV1().Pods(oc.Namespace()).List(ctx, metav1.ListOptions{LabelSelector: "app=" + label})
+		if err != nil {
+			return false, err
+		}
+		for _, pod := range pods.Items {
+			for _, cs := range pod.Status.ContainerStatuses {
+				if cs.Ready {
+					return true, nil
+				}
+			}
+		}
+		return false, nil
+	})
+	o.Expect(err).NotTo(o.HaveOccurred(), "no ready %s pod", label)
+}
+
+func waitForLog(ctx context.Context, oc *exutil.CLI, label, substr string) {
+	err := wait.PollUntilContextTimeout(ctx, 2*time.Second, 2*time.Minute, true, func(ctx context.Context) (bool, error) {
+		logs, err := pluginLogs(ctx, oc, label)
+		if err != nil {
+			return false, nil
+		}
+		return strings.Contains(logs, substr), nil
+	})
+	if err != nil {
+		logs, _ := pluginLogs(ctx, oc, label)
+		o.Expect(err).NotTo(o.HaveOccurred(), "no %q in the %s pod logs; last logs:\n%s", substr, label, logs)
+	}
 }
 
 func deletePlugin(ctx context.Context, oc *exutil.CLI, name string) {

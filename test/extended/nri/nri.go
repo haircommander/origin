@@ -3,6 +3,7 @@ package nri
 import (
 	"context"
 	"fmt"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -93,20 +94,12 @@ var _ = g.Describe("[Suite:openshift/nri][sig-node] Node Resource Interface", g.
 	})
 
 	g.It("enables NRI in CRI-O and registers the plugin", func(ctx context.Context) {
-		events, err := readEvents(ctx, oc, pluginName)
-		o.Expect(err).NotTo(o.HaveOccurred())
-
-		var configured, synced bool
-		for _, ev := range events {
-			switch ev.Kind {
-			case "configure":
-				configured = true
-			case "synchronize-pod", "synchronize-container":
-				synced = true
-			}
-		}
-		o.Expect(configured).To(o.BeTrue(), "plugin never received a Configure request from CRI-O")
-		o.Expect(synced).To(o.BeTrue(), "plugin never synchronized with CRI-O")
+		// waitForPlugin in BeforeAll already waited for Configure; Synchronize
+		// can arrive just after it, so wait instead of reading once.
+		_, err := waitForEvent(ctx, oc, pluginName, func(ev event) bool {
+			return ev.Kind == "synchronize-pod" || ev.Kind == "synchronize-container"
+		})
+		o.Expect(err).NotTo(o.HaveOccurred(), "plugin never synchronized with CRI-O")
 	})
 
 	g.It("relays pod and container lifecycle events to the plugin", func(ctx context.Context) {
@@ -368,6 +361,33 @@ var _ = g.Describe("[Suite:openshift/nri][sig-node] Node Resource Interface", g.
 		for _, name := range names {
 			deletePod(ctx, oc, namespace, name)
 		}
+	})
+
+	g.It("limits pod IOPS with the nri-iops community plugin", func(ctx context.Context) {
+		image := os.Getenv(iopsImageEnv)
+		if image == "" {
+			g.Skip("NRI_IOPS_PLUGIN_IMAGE is not set to a published nri-iops image")
+		}
+		deployIOPSPlugin(ctx, oc, node, image)
+		g.DeferCleanup(func(ctx context.Context) {
+			deleteIOPSPlugin(ctx, oc)
+		})
+
+		limited := createPod(ctx, oc, namespace, nodeName, "nri-iops-limited", podImage, map[string]string{
+			iopsAnnotation: "low-iops",
+		}, "/bin/bash", "-c", "sleep 3600")
+		waitPodRunning(ctx, oc, namespace, limited.Name, 3*time.Minute)
+
+		out, err := execInPod(ctx, oc, namespace, limited.Name, "cat", "/sys/fs/cgroup/io.max")
+		o.Expect(err).NotTo(o.HaveOccurred())
+		o.Expect(out).To(o.ContainSubstring("riops=100"), "io.max did not carry the read IOPS limit: %s", out)
+		o.Expect(out).To(o.ContainSubstring("wiops=100"), "io.max did not carry the write IOPS limit: %s", out)
+
+		control := createPod(ctx, oc, namespace, nodeName, "nri-iops-control", podImage, nil, "/bin/bash", "-c", "sleep 3600")
+		waitPodRunning(ctx, oc, namespace, control.Name, 3*time.Minute)
+		out, err = execInPod(ctx, oc, namespace, control.Name, "cat", "/sys/fs/cgroup/io.max")
+		o.Expect(err).NotTo(o.HaveOccurred())
+		o.Expect(out).NotTo(o.ContainSubstring("wiops="), "an unannotated pod received an IOPS limit: %s", out)
 	})
 
 	g.It("keeps creating pods while the plugin is down and resynchronizes when it returns", func(ctx context.Context) {

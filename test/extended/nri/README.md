@@ -40,7 +40,9 @@ $ openshift-tests run openshift/nri
 ```
 
 On a cluster whose release image is not reachable with the local pull secret, add
-`--extension-local-binaries-only` to skip external test binary extraction.
+`--extension-local-binaries-only` to skip external test binary extraction. Set
+`NRI_IOPS_PLUGIN_IMAGE` to a published community `nri-iops` image to run the
+IOPS-limit scenario; it skips without it.
 
 `run-test` matches test names exactly, so a single case needs its full name:
 

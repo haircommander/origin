@@ -1,6 +1,6 @@
 # NRI Test Case Catalogue
 
-Companion to [nri-test-plan.md](nri-test-plan.md). Detailed steps for every scenario implemented in [PR #31844](https://github.com/openshift/origin/pull/31844). All scenarios run on OCP 4.17+ (CRI-O 1.30+, NRI enabled by default) and target `test/extended/nri`.
+Companion to [nri-test-plan.md](nri-test-plan.md). Detailed steps for every scenario implemented in [PR #31844](https://github.com/openshift/origin/pull/31844) and the `nri-iops` follow-up branch. All scenarios run on OCP 4.17+ (CRI-O 1.30+, NRI enabled by default) and target `test/extended/nri`.
 
 Common setup for the e2e cases:
 
@@ -269,6 +269,39 @@ Each case below lists the spec name that identifies it.
 2. Read the plugin logs.
    **Expected:** a `create-container` event for each distinct pod identity (not just 10 events).
 3. Delete the pods.
+
+---
+
+## TC-FUNC-007 — Pod IOPS limit through the community nri-iops plugin
+
+- **Spec:** `limits pod IOPS with the nri-iops community plugin`
+- **Tier:** `e2e-serial`
+- **Target:** `test/extended/nri/nri.go`
+- **Coverage:** Covered; skips when `NRI_IOPS_PLUGIN_IMAGE` is unset
+- **Implementation:** `nri-iops-test` branch
+- **OCP applicability:** 4.17+
+- **Traceability:** NRI plugin IOPS limiting; [bitoku/blockio-nri](https://github.com/bitoku/blockio-nri)
+
+**Setup**
+
+1. Publish or choose a `nri-iops` image and export `NRI_IOPS_PLUGIN_IMAGE` (the image is not in the OpenShift payload).
+2. The suite creates a ConfigMap with one goresctrl class, `low-iops`, that matches the common cloud/VM **whole block devices** (`/dev/nvme[0-9]n[0-9]`, `/dev/nvme[0-9][0-9]n[0-9]`, `/dev/xvd[a-z]`, `/dev/sd[a-z]`, `/dev/vd[a-z]`, `/dev/dm-[0-9]*`, `/dev/mapper/*`) with `ThrottleReadIOPS: "100"` and `ThrottleWriteIOPS: "100"`. Partitions must not match: cgroup v2 `io.max` rejects a partition device and the runtime fails container creation with `write to io.max: No such device`.
+3. The suite deploys the `nri-iops` DaemonSet (index 90, privileged, NRI socket and `/dev` mounted) and waits for it to log `Connected to`.
+
+**Steps**
+
+1. Create a pod with `io-limits.noderesource.dev: low-iops` and wait for Running.
+2. `cat /sys/fs/cgroup/io.max` in the pod.
+   **Expected:** the output contains a device line with `riops=100` and `wiops=100`.
+3. Create a second pod without the annotation and wait for Running.
+4. `cat /sys/fs/cgroup/io.max` in the control pod.
+   **Expected:** no `wiops=` entry, so the unannotated pod is unlimited.
+
+**Cleanup**
+
+The suite deletes the DaemonSet and ConfigMap; the namespace deletion removes the pods.
+
+**Validated** on OCP 4.22.22 with a locally built `nri-iops` image: the annotated pod's `io.max` contained `riops=100 wiops=100` and the control pod was unlimited.
 
 ---
 
